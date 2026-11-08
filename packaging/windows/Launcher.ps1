@@ -1,6 +1,7 @@
 $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
+try {
 # Windows Job Object owns only our child processes. Closing the handle kills their descendants.
 Add-Type @'
 using System;
@@ -26,17 +27,35 @@ public sealed class PlantJob : IDisposable {
  public void Dispose() { if(handle!=IntPtr.Zero) { CloseHandle(handle); handle=IntPtr.Zero; } }
 }
 '@
+Add-Type -Path (Join-Path $PSScriptRoot 'ServiceProcess.cs')
+} catch {
+ $earlyLog=Join-Path $PSScriptRoot 'logs'
+ New-Item -ItemType Directory -Force $earlyLog | Out-Null
+ $_.Exception.ToString() | Add-Content -LiteralPath (Join-Path $earlyLog 'launcher-initialization.log') -Encoding UTF8
+ [System.Windows.Forms.MessageBox]::Show('Launcher initialization failed. Apply Repair-Startup.cmd from the updated source. Details: '+$_.Exception.Message,'PlantResearch AI','OK','Error') | Out-Null
+ exit 1
+}
 $script:job = $null
 $script:children = @()
 $script:ready = $false
 $script:starting = $false
 $script:mutex = New-Object System.Threading.Mutex($false,'Local\PlantResearchAI-SingleUser')
 if (!$script:mutex.WaitOne(0)) { [System.Windows.Forms.MessageBox]::Show('PlantResearch AI is already running. Use the existing launcher window.','PlantResearch AI') | Out-Null; exit }
-$root = $PSScriptRoot
+$root = [IO.Path]::GetFullPath($PSScriptRoot)
 $appRoot = Join-Path $root 'app'
 $logs = Join-Path $root 'logs'
 $data = Join-Path $root 'data'
-New-Item -ItemType Directory -Force $logs,$data | Out-Null
+New-Item -ItemType Directory -Force $logs | Out-Null
+$script:runLog = $null
+function Write-Diagnostic($message) {
+ if ($script:runLog) { Add-Content -LiteralPath $script:runLog -Value ((Get-Date -Format o)+' '+$message) -Encoding UTF8 }
+}
+function Fail-Startup($message) {
+ Write-Diagnostic ('FAILED: '+$message)
+ Stop-Services
+ $status.Text=$message+' Open logs for details.'
+ [System.Windows.Forms.MessageBox]::Show($form, $message+"`nDiagnostic log: "+$script:runLog, 'Startup failed','OK','Error') | Out-Null
+}
 $form = New-Object System.Windows.Forms.Form
 $form.Text = 'PlantResearch AI'
 $form.ClientSize = New-Object System.Drawing.Size(650,340)
@@ -84,54 +103,97 @@ $timer.Interval=1000
 function Stop-Services {
  $timer.Stop()
  if ($script:job) { $script:job.Dispose(); $script:job=$null }
- foreach ($p in $script:children) { try { $p.WaitForExit(3000) | Out-Null; if (!$p.HasExited) { $p.Kill() } } catch {} }
+ foreach ($child in $script:children) {
+  try { $child.Dispose(); Write-Diagnostic ('Stopped '+$child.Name) } catch { Write-Diagnostic ('Cleanup error: '+$_.Exception.Message) }
+ }
  $script:children=@(); $script:ready=$false; $script:starting=$false
- $open.Enabled=$false; $start.Enabled=$true; $apply.Enabled=$true; $status.Text='Services stopped. Research files remain saved locally.'
+ $open.Enabled=$false; $start.Enabled=$true; $apply.Enabled=$true
+ $status.Text='Services stopped. Research files remain saved locally.'
 }
 function Start-Child($exe,$arguments,$working,$name,$variables) {
- # Child-specific process environment is inherited then immediately restored.
- $old=@{}
- foreach($k in $variables.Keys) { $old[$k]=[Environment]::GetEnvironmentVariable($k,'Process'); [Environment]::SetEnvironmentVariable($k,[string]$variables[$k],'Process') }
- try {
-  $p=Start-Process -FilePath $exe -ArgumentList $arguments -WorkingDirectory $working -WindowStyle Hidden -PassThru -RedirectStandardOutput (Join-Path $logs ($name+'.out.log')) -RedirectStandardError (Join-Path $logs ($name+'.err.log'))
- } finally { foreach($k in $variables.Keys) { [Environment]::SetEnvironmentVariable($k,$old[$k],'Process') } }
- $script:children += $p
- try { $script:job.Add($p.Handle) } catch { if (!$p.HasExited) { $p.Kill() }; throw }
+ foreach ($path in @($exe,$working)) { if (!(Test-Path -LiteralPath $path)) { throw "Missing $name path: $path" } }
+ $envMap=New-Object 'System.Collections.Generic.Dictionary[string,string]'
+ # Ignore unrelated Python installations without modifying process/user/system settings.
+ $envMap['PYTHONHOME']=$null; $envMap['PYTHONPATH']=$null
+ foreach($k in $variables.Keys) { $envMap[$k]=[string]$variables[$k] }
+ $outPath=Join-Path $script:sessionLogs ($name+'.out.log')
+ $errPath=Join-Path $script:sessionLogs ($name+'.err.log')
+ Write-Diagnostic ("Starting $name executable=$exe cwd=$working args=$arguments stdout=$outPath stderr=$errPath")
+ $child=New-Object PlantService($name,$exe,$arguments,$working,$outPath,$errPath,$envMap)
+ $script:children += $child
+ $child.Start()
+ Write-Diagnostic ("Started $name PID="+$child.Process.Id)
+ $script:job.Add($child.Process.Handle)
+}
+function Start-Frontend {
+ Start-Child (Join-Path $root 'runtime\node\node.exe') 'node_modules\next\dist\bin\next start --hostname 127.0.0.1 --port 3000' (Join-Path $appRoot 'frontend') 'frontend' @{NEXT_TELEMETRY_DISABLED='1'}
+ $script:phase='frontend'; $script:deadline=[DateTime]::UtcNow.AddSeconds(120)
+ $status.Text='Backend ready. Waiting for frontend on port 3000...'
+ Write-Diagnostic 'Backend direct health check passed; frontend starting.'
 }
 function Start-Services {
  try {
+  $script:sessionLogs=Join-Path $logs ((Get-Date -Format 'yyyyMMdd-HHmmss')+'-'+[guid]::NewGuid().ToString('N').Substring(0,8))
+  New-Item -ItemType Directory $script:sessionLogs | Out-Null
+  $script:runLog=Join-Path $script:sessionLogs 'launcher.log'
+  Write-Diagnostic ('Launcher start; PowerShell='+$PSVersionTable.PSVersion+'; root='+$root)
   $start.Enabled=$false; $open.Enabled=$false; $apply.Enabled=$false
+  foreach ($relative in @('runtime\python\python.exe','runtime\python\Lib\encodings\__init__.py','runtime\node\node.exe','app\backend\bootstrap.py','app\backend\app.py','app\frontend\.next\BUILD_ID')) {
+   if (!(Test-Path -LiteralPath (Join-Path $root $relative))) { throw ('Installation is incomplete. Missing: '+$relative) }
+  }
   foreach ($port in @(3000,8000)) {
    $listener = New-Object System.Net.Sockets.TcpListener([System.Net.IPAddress]::Loopback,$port)
    try { $listener.Start() } catch { throw "Port $port is occupied. Close the other application, then click Start services. No unrelated processes were stopped." } finally { $listener.Stop() }
   }
   $script:job=New-Object PlantJob
-  $vars=@{PLANT_DATA_DIR=$data;MPLCONFIGDIR=(Join-Path $root 'matplotlib-cache');PYTHONNOUSERSITE='1';PYTHONUTF8='1';DEEPSEEK_API_KEY='';QWEN_API_KEY=''}
+  $vars=@{PLANT_DATA_DIR=$data;MPLCONFIGDIR=(Join-Path $root 'matplotlib-cache');PYTHONNOUSERSITE='1';PYTHONUTF8='1';PYTHONUNBUFFERED='1';PLANT_STARTUP_LOG=(Join-Path $script:sessionLogs 'python-startup.log');DEEPSEEK_API_KEY='';QWEN_API_KEY=''}
   if($key.Text) { if($provider.SelectedIndex -eq 0) {$vars.DEEPSEEK_API_KEY=$key.Text} else {$vars.QWEN_API_KEY=$key.Text} }
-  Start-Child (Join-Path $root 'runtime\python\python.exe') '-m uvicorn backend.app:app --host 127.0.0.1 --port 8000' $appRoot 'backend' $vars
-  Start-Child (Join-Path $root 'runtime\node\node.exe') 'node_modules\next\dist\bin\next start --hostname 127.0.0.1 --port 3000' (Join-Path $appRoot 'frontend') 'frontend' @{NEXT_TELEMETRY_DISABLED='1'}
+  $bootstrap=Join-Path $appRoot 'backend\bootstrap.py'
+  Start-Child (Join-Path $root 'runtime\python\python.exe') ('-u -X faulthandler "'+$bootstrap+'"') $appRoot 'backend' $vars
+  $script:phase='backend'
   $script:deadline=[DateTime]::UtcNow.AddSeconds(120); $script:starting=$true
-  $status.Text='Starting services. The browser will open when both services are ready...'; $timer.Start()
- } catch { $errorText=$_.Exception.Message; Stop-Services; $status.Text=$errorText+' See Open logs.' }
+  $status.Text='Waiting for Python backend on port 8000 (up to 120 seconds)...'
+  $script:lastHealthError='No response yet'; $timer.Start()
+ } catch { Fail-Startup $_.Exception.Message }
 }
-$timer.Add_Tick({
+function Update-ServiceState {
+ $timer.Stop() # Avoid reentrant GUI timer callbacks during HTTP requests.
  try {
-  foreach ($p in $script:children) { if ($p.HasExited) { throw 'A service exited unexpectedly. See Open logs for details.' } }
+  foreach ($child in $script:children) {
+   if ($child.HasExited) {
+    $child.FlushExited()
+    throw ($child.Name+' exited before/stopped after readiness. Exit code: '+$child.ExitCodeText+'. See '+$child.Name+'.err.log and python-startup.log.')
+   }
+  }
   if ($script:starting) {
    $healthy=$false
    try {
-    $health=Invoke-RestMethod 'http://127.0.0.1:3000/api/health' -TimeoutSec 1
-    $home=Invoke-WebRequest 'http://127.0.0.1:3000' -UseBasicParsing -TimeoutSec 2
-    $healthy=($health.status -eq 'ok' -and $home.StatusCode -eq 200)
-   } catch {}
-   if($healthy) {
-    $script:starting=$false; $script:ready=$true; $open.Enabled=$true; $apply.Enabled=$true
-    $status.Text='Running - http://localhost:3000. Keep this launcher open.'
-    Start-Process 'http://localhost:3000'
-   } elseif ([DateTime]::UtcNow -gt $script:deadline) { throw 'Startup timed out. See Open logs; services have been stopped.' }
+    if ($script:phase -eq 'backend') {
+     $backendHealth=Invoke-RestMethod 'http://127.0.0.1:8000/api/health' -TimeoutSec 1
+     $healthy=($backendHealth.status -eq 'ok')
+    } else {
+     $proxyHealth=Invoke-RestMethod 'http://127.0.0.1:3000/api/health' -TimeoutSec 1
+     $pageResponse=Invoke-WebRequest 'http://127.0.0.1:3000' -UseBasicParsing -TimeoutSec 2
+     $healthy=($proxyHealth.status -eq 'ok' -and $pageResponse.StatusCode -eq 200)
+    }
+    if (!$healthy) { $script:lastHealthError='Health response was not status=ok' }
+   } catch { $script:lastHealthError=$_.Exception.Message }
+   if ($healthy) {
+    if ($script:phase -eq 'backend') { Start-Frontend }
+    else {
+     $script:starting=$false; $script:ready=$true; $open.Enabled=$true; $apply.Enabled=$true
+     $status.Text='Running - http://localhost:3000. Keep this launcher open.'
+     Write-Diagnostic 'Frontend homepage and proxy health checks passed.'
+     try { Start-Process 'http://localhost:3000' } catch { Write-Diagnostic 'Browser could not be opened automatically. Use Open website.' }
+    }
+   } elseif ([DateTime]::UtcNow -gt $script:deadline) {
+    throw ($script:phase+' startup timed out. Last health error: '+$script:lastHealthError+'. See logs for import progress or native-runtime errors.')
+   }
   }
- } catch { $errorText=$_.Exception.Message; Stop-Services; $status.Text=$errorText }
-})
+ } catch { Fail-Startup $_.Exception.Message }
+ finally { if ($script:starting -or $script:ready) { $timer.Start() } }
+}
+$timer.Add_Tick({Update-ServiceState})
 $open.Add_Click({Start-Process 'http://localhost:3000'})
 $stop.Add_Click({Stop-Services})
 $start.Add_Click({Start-Services})

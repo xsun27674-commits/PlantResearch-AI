@@ -68,3 +68,7 @@ SQLite在 `backend/private_data/tasks.sqlite`，可由 PLANT_DATA_DIR 修改。�
 ## Windows一键离线包
 
 已有预发布的一键安装包：将 `PlantResearch-AI-Windows-x64.zip` 全部解压后双击 `Install.cmd`。内置Windows Python、Node、全部依赖和生产前端，用户无需命令行操作。详见 [打包与验证范围](docs/WINDOWS-PACKAGE.md)。此包在Linux组装，尚未在Windows实机验收。
+
+## 已安装的Windows软件无法启动
+
+下载启动修复分支源码后，关闭旧启动器，双击源码根目录的 `Repair-Startup.cmd`。它备份并更新启动代码，不重装依赖、不修改科研数据。诊断日志位置、已修复问题和Windows待验证范围见 [Windows启动修复](docs/WINDOWS-STARTUP-REPAIR.md)。

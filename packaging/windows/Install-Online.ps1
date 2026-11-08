@@ -36,6 +36,7 @@ try {
  }
  Copy-Item (Join-Path $source 'README.md') $app
  Copy-Item (Join-Path $PSScriptRoot 'Launcher.ps1') (Join-Path $stage 'Launcher.ps1')
+ Copy-Item (Join-Path $PSScriptRoot 'ServiceProcess.cs') (Join-Path $stage 'ServiceProcess.cs')
  $python=Join-Path $stage 'runtime\python\python.exe'
  $node=Join-Path $stage 'runtime\node'
  $env:PATH=$node+';'+$originalPath
