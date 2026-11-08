@@ -1,0 +1,34 @@
+.venv/
+__pycache__/
+.pytest_cache/
+backend/private_data/
+frontend/node_modules/
+frontend/.next/
+.env
+*.log
+
+# Secrets and local credentials
+.env.*
+!.env.example
+.npmrc
+.pypirc
+*.pem
+*.key
+
+# Private data, generated runtimes, caches and packages
+data/
+uploads/
+runtime/
+logs/
+*.sqlite
+*.sqlite3
+*.sqlite-*
+*.sqlite3-*
+*.db
+*.zip
+*.whl
+*.nupkg
+*.tar.gz
+*.tsbuildinfo
+.DS_Store
+Thumbs.db
