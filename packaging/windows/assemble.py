@@ -19,6 +19,7 @@ for src in (repo/'frontend/.next').rglob('*'):
     if not src.is_file() or any(p in {'dev','cache','diagnostics'} for p in rel.parts):continue
     dest=app/'frontend/.next'/rel;dest.parent.mkdir(parents=True,exist_ok=True);shutil.copy2(src,dest)
 shutil.copy2(repo/'packaging/windows/Launcher.ps1',stage/'Launcher.ps1')
+shutil.copy2(repo/'packaging/windows/ServiceProcess.cs',stage/'ServiceProcess.cs')
 # Keep a reusable wheel archive and exact wheels manifest for future maintenance.
 wheel_info=[]
 for p in sorted((build/'wheels').glob('*.whl')):
