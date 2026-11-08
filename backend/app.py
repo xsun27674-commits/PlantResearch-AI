@@ -73,24 +73,58 @@ def chart(key:str, q:Chart):
     df=frame(key)
     if q.kind not in {'bar','scatter','box','heatmap'}: raise HTTPException(400,'未知图表类型')
     if q.x not in df or (q.y and q.y not in df): raise HTTPException(400,'列不存在')
+    def numeric(column):
+        values = df[column]
+        if not pd.api.types.is_numeric_dtype(values) or pd.api.types.is_bool_dtype(values):
+            raise ValueError(f'“{column}”是分类或文本列，请选择数值列；分类列可用作箱线图或柱状图的X轴')
+        return values.replace([np.inf, -np.inf], np.nan)
+
+    # Prefer Chinese fonts available on Windows, with standard fallbacks elsewhere.
+    plt.rcParams['font.sans-serif'] = ['Microsoft YaHei', 'SimHei', 'DejaVu Sans']
+    plt.rcParams['axes.unicode_minus'] = False
     fig,ax=plt.subplots(figsize=(8,5))
+    report = {'total_rows':len(df), 'missing_policy':'仅删除本图所需列中缺失或非有限值的行，不填补、不修改原数据'}
     try:
         if q.kind=='heatmap':
-            corr=df.select_dtypes(include='number').corr()
-            if corr.empty: raise ValueError('热图需要数值列')
+            selected=df.select_dtypes(include='number').replace([np.inf,-np.inf],np.nan)
+            corr=selected.corr()
+            if corr.empty or not corr.notna().any().any(): raise ValueError('热图需要至少一个具有有效相关系数的数值列')
+            report.update(missing_policy='相关系数按每对数值列的有效成对观测计算，不填补、不修改原数据', missing_by_column=selected.isna().sum().to_dict())
             im=ax.imshow(corr,vmin=-1,vmax=1,cmap='YlGn'); fig.colorbar(im,ax=ax); ax.set_xticks(range(len(corr)),corr.columns,rotation=45); ax.set_yticks(range(len(corr)),corr.columns)
-        elif q.kind=='box': ax.boxplot(pd.to_numeric(df[q.x],errors='raise').dropna()); ax.set_xlabel(q.x)
+        elif q.kind=='box' and pd.api.types.is_numeric_dtype(df[q.x]):
+            values=numeric(q.x).dropna()
+            if values.empty: raise ValueError('所选数值列没有可绘制的有效数据')
+            report.update(used_rows=len(values), dropped_rows=len(df)-len(values))
+            ax.boxplot(values); ax.set_ylabel(q.x)
         else:
-            if not q.y: raise ValueError('请选择Y列')
-            y=pd.to_numeric(df[q.y],errors='raise')
-            if q.kind=='bar':
-                grouped=df.assign(**{q.y:y}).groupby(q.x)[q.y].mean().head(50); ax.bar(grouped.index.astype(str),grouped.values); ax.tick_params(axis='x',rotation=45); ax.set_title('Group mean (first 50 groups)')
-            else: ax.scatter(pd.to_numeric(df[q.x],errors='raise'),y)
+            if not q.y: raise ValueError('请选择Y数值列；分组图使用X分类列和Y数值列')
+            y=numeric(q.y)
+            x=numeric(q.x) if q.kind=='scatter' else df[q.x].replace(r'^\s*$',np.nan,regex=True)
+            # Internal names also support selecting the same column for both axes.
+            valid=pd.DataFrame({'x':x,'y':y}).dropna()
+            if valid.empty: raise ValueError('删除所选列的缺失值后没有可绘制的数据，请重新选择数据列')
+            report.update(used_rows=len(valid), dropped_rows=len(df)-len(valid))
+            if q.kind in {'bar','box'}:
+                groups=list(valid.groupby('x',sort=False,observed=True))
+                shown=groups[:50]
+                report.update(total_groups=len(groups), shown_groups=len(shown), aggregation='mean' if q.kind=='bar' else 'distribution', plotted_rows=sum(len(g) for _,g in shown))
+                labels=[str(label) for label,_ in shown]
+                if q.kind=='bar': ax.bar(labels,[g['y'].mean() for _,g in shown])
+                else:
+                    ax.boxplot([g['y'].to_numpy() for _,g in shown])
+                    ax.set_xticks(range(1,len(shown)+1),labels)
+                ax.tick_params(axis='x',rotation=45)
+                ax.set_title('Group mean (first 50 groups)' if q.kind=='bar' else 'Grouped distribution (first 50 groups)')
+            else: ax.scatter(valid['x'],valid['y'])
             ax.set_xlabel(q.x); ax.set_ylabel(q.y)
-        fig.tight_layout(); out=io.BytesIO(); fig.savefig(out,format='png',dpi=140)
-    except Exception as e: raise HTTPException(400,f'绘图失败：{e}')
+        note = (f"Missing/non-finite rows removed: {report['dropped_rows']}/{len(df)}; no imputation"
+                if 'dropped_rows' in report else 'Correlation: pairwise complete observations; no imputation')
+        fig.text(0.02,0.01,note,fontsize=8)
+        fig.tight_layout(rect=(0,0.05,1,1)); out=io.BytesIO(); fig.savefig(out,format='png',dpi=140)
+    except ValueError as e: raise HTTPException(400,f'绘图失败：{e}')
     finally: plt.close(fig)
-    params=q.model_dump(); save('chart',{'dataset':key,'parameters':params})
+    params={**q.model_dump(),'analysis':report}
+    save('chart',{'dataset':key,'parameters':params})
     return Response(out.getvalue(),media_type='image/png',headers={'Content-Disposition':'attachment; filename="chart.png"','X-Analysis-Parameters':json.dumps(params)})
 @app.get('/api/results/{key}/download')
 def download(key:str, format:str='csv'):
